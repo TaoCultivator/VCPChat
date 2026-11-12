@@ -68,6 +68,12 @@ let groupAgentConfigLoader = null;
 let jevSessionOrchestrator = null;
 const groupStreamCallbacks = new Map();
 const ordinaryGroupRuns = new Map();
+// 同一 (群组, 话题, Agent) 的邀请在途锁。JEV 仲裁失败后可能立刻重选同一成员，
+// 而前端按 messageId 建气泡，重复邀请必然产出重复占位（主人遇到的「两个 Nova 思考中」）。
+// key 用 \u0000 分隔，避免 id 本身含分隔符时误撞。
+// 加 TTL 兜底：若某次邀请因异常卡死未能进入 finally，超时后强制释放，宁可放行也不永久占锁。
+const inviteInFlight = new Map(); // `${groupId}\u0000${topicId}\u0000${agentId}` → { since }
+const INVITE_IN_FLIGHT_TTL_MS = 10 * 60 * 1000;
 
 function getGroupQueueKey(groupId, topicId) {
     return `${String(groupId)}\u0000${String(topicId)}`;
@@ -1597,7 +1603,11 @@ ${canvasData.errors || 'No errors'}
                             const streamErrorResponseEntry = { role: 'assistant', name: agentName, agentId: agentId, content: errorText, timestamp: Date.now(), id: messageIdForAgentResponse, isGroupMessage: true, groupId, topicId };
                             groupHistory = await persistAgentResponse(groupId, topicId, streamErrorResponseEntry);
                             if (typeof sendStreamChunkToRenderer === 'function') {
-                                sendStreamChunkToRenderer({ type: 'error', error: `VCP stream reading error: ${streamError.message}`, messageId: messageIdForAgentResponse, context: { groupId, topicId, agentId, agentName, isGroupMessage: true } });
+                                const streamErrorDetail = streamError.message || getGroupErrorMessage(streamError);
+                                sendStreamChunkToRenderer({ type: 'error', error: `VCP stream reading error: ${streamErrorDetail}`, messageId: messageIdForAgentResponse, context: { groupId, topicId, agentId, agentName, isGroupMessage: true } });
+                                // error 事件不保证终结前端占位；补一条 end 让其一定拿到终态，
+                                // 否则「思考中」气泡会永远留在界面上。
+                                sendStreamChunkToRenderer({ type: 'end', error: streamErrorDetail, fullResponse: errorText, messageId: messageIdForAgentResponse, context: { groupId, topicId, agentId, agentName, isGroupMessage: true } });
                             }
                         }
                     } finally {
@@ -1712,26 +1722,54 @@ ${canvasData.errors || 'No errors'}
  * @returns {Promise<void>}
  */
 async function handleInviteAgentToSpeak(groupId, topicId, invitedAgentId, sendStreamChunkToRenderer, getAgentConfigById, options = {}) {
-    const admissionQueueContext = createGroupQueueContext(groupId, topicId);
-    const admission = groupTopicAdmission;
-    const config = admission ? await getAgentGroupConfig(groupId) : null;
-    if (!admission || config?.mode === 'game') {
-        return handleInviteAgentToSpeakOwned(groupId, topicId, invitedAgentId, sendStreamChunkToRenderer, getAgentConfigById, options);
+    // 只按 (群组, 话题, Agent) 去重：不同 Agent 的正常并发不受影响，
+    // 串行邀请（JEV 逐轮 await）在前一次 finally 释放后也不会被误伤。
+    const inviteLockKey = `${groupId}\u0000${topicId}\u0000${invitedAgentId}`;
+    const existingInvite = inviteInFlight.get(inviteLockKey);
+    if (existingInvite) {
+        const elapsed = Date.now() - existingInvite.since;
+        if (elapsed < INVITE_IN_FLIGHT_TTL_MS) {
+            console.warn(
+                `[GroupChat] 重复邀请被拦截: agent=${invitedAgentId} ` +
+                `group=${groupId} topic=${topicId} ` +
+                `在途 ${Math.round(elapsed / 1000)}s (起于 ${new Date(existingInvite.since).toISOString()})`
+            );
+            return;
+        }
+        // 超过 TTL 仍未释放，说明先前那次没能走到 finally（异常或强杀）；
+        // 此时放行本次请求，避免永久锁死该成员。
+        console.warn(
+            `[GroupChat] 在途邀请超过 TTL 仍未释放，强制放行: agent=${invitedAgentId} ` +
+            `group=${groupId} topic=${topicId} 已挂 ${Math.round(elapsed / 1000)}s`
+        );
+        inviteInFlight.delete(inviteLockKey);
     }
-    return withTopicGenerationLease({
-        admission,
-        scope: getGroupHistoryDescriptor(groupId, topicId),
-        token: options.admissionToken || crypto.randomUUID(),
-        wait: true,
-        signal: options.signal,
-        handoffOwner: options.handoffOwner,
-        operation: lifecycle => {
-            if (admissionQueueContext.isAborted() || options.signal?.aborted) return;
-            return handleInviteAgentToSpeakOwned(
-                groupId, topicId, invitedAgentId, sendStreamChunkToRenderer,
-                getAgentConfigById, { ...options, admissionQueueContext, admissionLifecycle: lifecycle });
-        },
-    });
+    inviteInFlight.set(inviteLockKey, { since: Date.now() });
+    try {
+        // ——话题级 lease 串行（来自 HEAD upstream，保留原语义）——
+        const admissionQueueContext = createGroupQueueContext(groupId, topicId);
+        const admission = groupTopicAdmission;
+        const config = admission ? await getAgentGroupConfig(groupId) : null;
+        if (!admission || config?.mode === 'game') {
+            return await handleInviteAgentToSpeakOwned(groupId, topicId, invitedAgentId, sendStreamChunkToRenderer, getAgentConfigById, options);
+        }
+        return await withTopicGenerationLease({
+            admission,
+            scope: getGroupHistoryDescriptor(groupId, topicId),
+            token: options.admissionToken || crypto.randomUUID(),
+            wait: true,
+            signal: options.signal,
+            handoffOwner: options.handoffOwner,
+            operation: lifecycle => {
+                if (admissionQueueContext.isAborted() || options.signal?.aborted) return;
+                return handleInviteAgentToSpeakOwned(
+                    groupId, topicId, invitedAgentId, sendStreamChunkToRenderer,
+                    getAgentConfigById, { ...options, admissionQueueContext, admissionLifecycle: lifecycle });
+            },
+        });
+    } finally {
+        inviteInFlight.delete(inviteLockKey);
+    }
 }
 
 async function handleInviteAgentToSpeakOwned(groupId, topicId, invitedAgentId, sendStreamChunkToRenderer, getAgentConfigById, options = {}) {
@@ -2307,7 +2345,11 @@ ${canvasData.errors || 'No errors'}
                         const streamErrorResponseEntry = { role: 'assistant', name: agentName, agentId: invitedAgentId, content: errorText, timestamp: Date.now(), id: messageIdForAgentResponse, isGroupMessage: true, groupId, topicId };
                         groupHistory = await persistResponse(groupId, topicId, streamErrorResponseEntry);
                         if (typeof sendStreamChunkToRenderer === 'function') {
-                            sendStreamChunkToRenderer({ type: 'error', error: `VCP stream reading error (invite): ${streamError.message}`, messageId: messageIdForAgentResponse, context: { groupId, topicId, agentId: invitedAgentId, agentName, isGroupMessage: true } });
+                            const streamErrorDetail = streamError.message || getGroupErrorMessage(streamError);
+                            sendStreamChunkToRenderer({ type: 'error', error: `VCP stream reading error (invite): ${streamErrorDetail}`, messageId: messageIdForAgentResponse, context: { groupId, topicId, agentId: invitedAgentId, agentName, isGroupMessage: true } });
+                            // error 事件不保证终结前端占位；补一条 end 让其一定拿到终态，
+                            // 否则「思考中」气泡会永远留在界面上。
+                            sendStreamChunkToRenderer({ type: 'end', error: streamErrorDetail, fullResponse: errorText, messageId: messageIdForAgentResponse, context: { groupId, topicId, agentId: invitedAgentId, agentName, isGroupMessage: true } });
                         }
                     }
                 } finally {
@@ -2621,6 +2663,17 @@ async function redoGroupChatMessage(groupId, topicId, messageIdToDelete, agentId
         const agent = await getAgentConfigById(agentIdToReInvite);
         if (!groupConfig || !groupConfig.members?.includes(agentIdToReInvite) || !agent || agent.error) {
             throw new Error('无法重新回复：受邀群成员不存在或配置无效。');
+        }
+        // redo 会先删历史再重新邀请。若该成员此刻仍在途，删除历史后将没有新回复补上，
+        // 留下「消息消失但没重建」的不一致状态。因此在任何写操作之前先拒绝。
+        const redoLockKey = `${groupId}\u0000${topicId}\u0000${agentIdToReInvite}`;
+        const redoConflicting = inviteInFlight.get(redoLockKey);
+        if (redoConflicting && Date.now() - redoConflicting.since < INVITE_IN_FLIGHT_TTL_MS) {
+            console.warn(`[GroupChat Redo] ${agentIdToReInvite} 正在发言中，拒绝重生成以保持历史一致 (${groupId}/${topicId})`);
+            if (typeof sendStreamChunkToRenderer === 'function') {
+                sendStreamChunkToRenderer({ type: 'error', error: '该成员正在发言中，请等当前回复结束后再重新生成。', context: { groupId, topicId, agentId: agentIdToReInvite, isGroupMessage: true } });
+            }
+            return;
         }
         let removed = false;
         const removeTarget = history => {

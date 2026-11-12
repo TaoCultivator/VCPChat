@@ -5,7 +5,7 @@ const path = require('node:path');
 
 const {
     noteToolApprovalMessage, isWaitingForToolApproval, clearToolApprovals,
-    isWatchdogAbort, withWatchdogNote, MAX_HOLD_MS
+    isWatchdogAbort, withWatchdogNote, MAX_HOLD_MS, MAX_CONSECUTIVE_HOLDS
 } = require('../Groupmodules/streamWatchdog');
 
 // 真实 VCPLog 消息形状
@@ -23,16 +23,47 @@ test('an agent waiting for a tool approval holds the watchdog until the approval
     assert.equal(isWaitingForToolApproval('Nova'), false);
 });
 
-test('approvals without a maid hold everyone, stale ones expire, junk is ignored', () => {
+test('ownerless approvals hold nobody, stale ones expire, junk is ignored', () => {
     clearToolApprovals();
+    // 无主审批无法证明归属。历史上它被当成“大家都在等”，结果所有 agent 的
+    // 块间看门狗无限续期，气泡永远停在「思考中」。现在只认 maid 明确匹配的审批。
     noteToolApprovalMessage(request('r2', ''));
-    assert.equal(isWaitingForToolApproval('Ulka'), true);
+    assert.equal(isWaitingForToolApproval('Ulka'), false, 'ownerless approval must not hold an unrelated agent');
+    assert.equal(isWaitingForToolApproval('Nova'), false, 'ownerless approval must not hold anyone');
     const now = Date.now();
     assert.equal(isWaitingForToolApproval('Ulka', now + MAX_HOLD_MS + 1), false, 'answered elsewhere and never reported: give up eventually');
     noteToolApprovalMessage(null);
     noteToolApprovalMessage({ type: 'vcp_log', data: 'x' });
     noteToolApprovalMessage({ type: 'tool_approval_request', data: {} });
     assert.equal(isWaitingForToolApproval('Nova'), false);
+});
+
+test('a single approval cannot hold the watchdog past MAX_CONSECUTIVE_HOLDS checks', () => {
+    clearToolApprovals();
+    noteToolApprovalMessage(request('r3', 'Nova'));
+    for (let i = 1; i <= MAX_CONSECUTIVE_HOLDS; i += 1) {
+        assert.equal(isWaitingForToolApproval('Nova'), true, `hold #${i} is still honoured`);
+    }
+    assert.equal(
+        isWaitingForToolApproval('Nova'),
+        false,
+        'past the cap the watchdog must be allowed to fire instead of holding forever'
+    );
+});
+
+test('answering an approval resets its hold streak and does not leak into the next request', () => {
+    clearToolApprovals();
+    noteToolApprovalMessage(request('r4', 'Nova'));
+    isWaitingForToolApproval('Nova');
+    isWaitingForToolApproval('Nova');
+    noteToolApprovalMessage(response('r4'));
+    assert.equal(isWaitingForToolApproval('Nova'), false, 'answered approval releases immediately');
+
+    // 新请求从零计数，不受上一条的历史影响。
+    noteToolApprovalMessage(request('r5', 'Nova'));
+    for (let i = 1; i <= MAX_CONSECUTIVE_HOLDS; i += 1) {
+        assert.equal(isWaitingForToolApproval('Nova'), true, `new request hold #${i} starts fresh`);
+    }
 });
 
 test('a reader aborted by the watchdog throws the string reason; a user interrupt throws AbortError', async (t) => {
