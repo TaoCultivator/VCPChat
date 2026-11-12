@@ -512,6 +512,45 @@ body.light-theme .message-item.system.welcome-bubble {
     padding: 5px 0; 
 }
 
+/* thinking 气泡静默超时后的“已中断”降级态。
+   视觉上刻意弱于正常消息，避免抢注意力；重试按钮是唯一可交互元素。 */
+.stream-stalled-notice {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 6px;
+    padding: 6px 10px;
+    border-left: 2px solid rgba(255, 170, 60, 0.65);
+    border-radius: 4px;
+    background: rgba(255, 170, 60, 0.08);
+    font-size: 0.85em;
+}
+
+.stream-stalled-label {
+    color: var(--secondary-text);
+    opacity: 0.85;
+}
+
+.stream-stalled-retry {
+    padding: 3px 10px;
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--primary-text);
+    font-size: 0.95em;
+    cursor: pointer;
+    transition: background 0.15s ease, opacity 0.15s ease;
+}
+
+.stream-stalled-retry:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.14);
+}
+
+.stream-stalled-retry:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
 .message-controls {
     position: absolute;
     top: 2px;

@@ -3243,6 +3243,43 @@ function initializeMessageRenderer(refs) {
         enhancedRenderDebounceTimers: enhancedRenderDebounceTimers,
         ENHANCED_RENDER_DEBOUNCE_DELAY: ENHANCED_RENDER_DEBOUNCE_DELAY,
         DIARY_RENDER_DEBOUNCE_DELAY: DIARY_RENDER_DEBOUNCE_DELAY,
+        // thinking 气泡静默超时后的重试入口。
+        // 群聊与单聊的重发通道不同：群聊必须走 redoGroupChatMessage 让指定 agent
+        // 重新发言；单聊复用既有的 handleRegenerateResponse。
+        onStalledStreamRetry: async (messageId, stalledPayload = {}) => {
+            const { context: stalledContext, message: stalledMessage } = stalledPayload;
+            const selected = mainRendererReferences.currentSelectedItemRef.get();
+            const topicId = mainRendererReferences.currentTopicIdRef.get();
+            const notify = mainRendererReferences.uiHelper;
+            if (!selected?.id || !topicId) {
+                notify?.showToastNotification?.('无法重试：缺少会话上下文', 'warning');
+                return;
+            }
+            if (selected.type === 'group') {
+                const agentId = stalledContext?.agentId || stalledMessage?.agentId || null;
+                if (!agentId) {
+                    notify?.showToastNotification?.('无法重试：缺少发言者信息', 'warning');
+                    return;
+                }
+                await mainRendererReferences.electronAPI.redoGroupChatMessage(
+                    selected.id,
+                    topicId,
+                    messageId,
+                    agentId
+                );
+                return;
+            }
+            // 单聊：handleRegenerateResponse 依据 history 中的原对象定位，
+            // 因此只能传真实历史条目；用快照兜底会让它读到缺 role 的对象，
+            // 抛出误导性的“只能为 Agent 的回复进行重新生成”。
+            const liveHistory = mainRendererReferences.currentChatHistoryRef.get() || [];
+            const target = liveHistory.find(entry => entry?.id === messageId);
+            if (!target) {
+                notify?.showToastNotification?.('无法重试：原消息已不在当前上下文', 'warning');
+                return;
+            }
+            await contextMenu.handleRegenerateResponse(target);
+        },
     });
 
     if (features.middleClick) middleClickHandler.initialize(mainRendererReferences, {

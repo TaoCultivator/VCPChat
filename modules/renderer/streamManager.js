@@ -50,6 +50,21 @@ const DAILY_NOTE_START = '<<<DailyNoteStart>>>';
 const DAILY_NOTE_END = '<<<DailyNoteEnd>>>';
 const MARKDOWN_SECTION_BREAK_TOKEN = '---';
 const STREAM_PARAGRAPH_SAFETY_BLOCKS = 1;
+
+// ---- thinking 气泡自愈（stall watchdog）----
+// JEV 在每次工具往返后会无限续期下一次请求，这段等待期不产生任何 chunk，
+// 渲染层依赖 `!isActiveStreamRequest` 的清理因此永不成立。判定“流已死”的
+// 唯一可靠依据是收帧侧的静默时长：超过阈值没有任何 inflight 数据即降级。
+const STREAM_STALL_TIMEOUT_MS = 180000;
+const STREAM_STALL_SWEEP_INTERVAL_MS = 5000;
+const STREAM_STALL_FINISH_REASON = 'stalled';
+const STREAM_STALL_NOTICE_TEXT = '响应已中断';
+const STREAM_STALL_CLASS = 'stream-stalled';
+// projectStreamTerminal 在 initStatus==='pending' 时会等待初始化 waiter。流真死时
+// 该 waiter 永不到达，终态就永不返回，装饰也就永不执行 —— 自愈会静默失效。
+// 这道 grace 上限只约束“等待终态返回”的时长，不改变终态本身的语义。
+const STREAM_STALL_TERMINAL_GRACE_MS = 5000;
+const STREAM_STALL_TERMINAL_TIMED_OUT = Object.freeze({ timedOut: true });
 const HTML_ISLAND_MAX_STACK_DEPTH = 128;
 const HTML_ISLAND_MAX_CHARS = 256 * 1024;
 const HTML_RAWTEXT_TAGS = new Set(['script', 'style']);
@@ -204,6 +219,10 @@ const pendingAsyncOperations = new Set();
 const streamDomRecoveryOperations = new Map();
 const ownedTimeouts = new Set();
 const scheduledAnimationFrames = new Set();
+// 活动流最后一次收到 inflight 数据的时间戳（ms）。与 activeStreamingMessages
+// 同生命周期，供 stall watchdog 判定静默时长。
+const streamActivityAt = new Map();
+let stallSweepTimer = null;
 
 function trackAsyncOperation(operation) {
     const promise = Promise.resolve(operation);
@@ -229,6 +248,168 @@ function clearOwnedTimeout(record) {
     if (!record) return;
     record.clear(record.id);
     ownedTimeouts.delete(record);
+}
+
+// thinking 气泡自愈的时钟与打点辅助。
+// 注入式时钟让测试无需真实等待 180 秒即可推进静默时长。
+function streamClockNow() {
+    return typeof refs.now === 'function' ? refs.now() : Date.now();
+}
+
+function stallSweepIntervalMs() {
+    const override = Number(refs.streamStallSweepIntervalMs);
+    return Number.isFinite(override) && override > 0 ? override : STREAM_STALL_SWEEP_INTERVAL_MS;
+}
+
+function markStreamActivity(messageId) {
+    if (disposed) return;
+    if (!activeStreamingMessages.has(messageId)) return;
+    streamActivityAt.set(String(messageId), streamClockNow());
+    ensureStallSweep();
+}
+
+function ensureStallSweep() {
+    if (disposed || stallSweepTimer || activeStreamingMessages.size === 0) return;
+    stallSweepTimer = scheduleOwnedTimeout(runStallSweep, stallSweepIntervalMs());
+}
+
+function stopStallSweepIfIdle() {
+    if (activeStreamingMessages.size > 0) return;
+    if (stallSweepTimer) {
+        clearOwnedTimeout(stallSweepTimer);
+        stallSweepTimer = null;
+    }
+    streamActivityAt.clear();
+}
+
+function runStallSweep() {
+    stallSweepTimer = null;
+    if (disposed) return;
+    const now = streamClockNow();
+    const stalledMessageIds = [];
+    for (const [messageId] of activeStreamingMessages.entries()) {
+        const lastActivity = streamActivityAt.get(String(messageId));
+        if (lastActivity === undefined) continue;
+        if (now - lastActivity >= STREAM_STALL_TIMEOUT_MS) stalledMessageIds.push(String(messageId));
+    }
+    for (const messageId of stalledMessageIds) {
+        // 每条降级独立成任务，一条慢终态不该阻塞其余巡检。
+        trackAsyncOperation(recoverStalledStream(messageId));
+    }
+    if (activeStreamingMessages.size > 0) {
+        stallSweepTimer = scheduleOwnedTimeout(runStallSweep, stallSweepIntervalMs());
+    }
+}
+
+async function recoverStalledStream(messageId) {
+    const key = String(messageId);
+    if (disposed) return;
+    const context = messageContextMap.get(messageId) || activeStreamingMessages.get(messageId) || null;
+    const lastActivity = streamActivityAt.get(key);
+    if (!context || lastActivity === undefined) {
+        streamActivityAt.delete(key);
+        stopStallSweepIfIdle();
+        return;
+    }
+    // 巡检取快照之后可能又收到了真实数据，一律以最新打点为准。
+    if (streamClockNow() - lastActivity < STREAM_STALL_TIMEOUT_MS) return;
+    if (!isMessageActive(messageId)) {
+        streamActivityAt.delete(key);
+        stopStallSweepIfIdle();
+        return;
+    }
+
+    // 终态投影会清掉 messageContextMap 与 streamMessageModels，先留快照供装饰使用。
+    const message = streamMessageModels.get(messageId) || { id: messageId };
+    const silentSeconds = Math.round(STREAM_STALL_TIMEOUT_MS / 1000);
+    console.warn('[StreamManager] Stream stalled ' + silentSeconds + 's without inflight data: ' + messageId);
+
+    let terminal = null;
+    let graceTimer = null;
+    try {
+        // 复用正规终态投影而非直接改 DOM：transient history 必须被收尾，
+        // 否则这条消息会以 inflight 身份存活到下次刷新。
+        const terminalPromise = projectStreamTerminal(messageId, STREAM_STALL_FINISH_REASON, context, {
+            error: '流式响应在 ' + silentSeconds + ' 秒内没有任何数据，已中断。',
+        }).catch(error => {
+            console.error('[StreamManager] Stalled stream terminal projection failed for ' + messageId, error);
+            return null;
+        });
+        const gracePromise = new Promise(resolve => {
+            graceTimer = scheduleOwnedTimeout(() => resolve(STREAM_STALL_TERMINAL_TIMED_OUT), STREAM_STALL_TERMINAL_GRACE_MS);
+        });
+        const outcome = await Promise.race([terminalPromise, gracePromise]);
+        if (outcome === STREAM_STALL_TERMINAL_TIMED_OUT) {
+            // 终态迟迟不返回（典型的 pending 初始化死等）。放弃等待但照常装饰：
+            // 气泡停在“思考中”比停在“已中断”糟糕得多。
+            console.warn('[StreamManager] Stalled terminal projection exceeded grace window for ' + messageId);
+        } else {
+            terminal = outcome;
+        }
+    } finally {
+        if (graceTimer) clearOwnedTimeout(graceTimer);
+        streamActivityAt.delete(key);
+        stopStallSweepIfIdle();
+    }
+    // 终态投影可能重建气泡，装饰必须发生在其之后。
+    decorateStalledMessage(messageId, context, message, terminal);
+}
+
+function decorateStalledMessage(messageId, context, message, terminal) {
+    if (disposed) return;
+    const { chatMessagesDiv } = refs;
+    const doc = ownerDocument();
+    if (!chatMessagesDiv?.querySelector || !doc) return;
+    let forCurrentView = false;
+    try {
+        forCurrentView = isMessageForCurrentView(context);
+    } catch (error) {
+        console.warn('[StreamManager] Could not resolve view authority for stalled message ' + messageId, error);
+    }
+    if (!forCurrentView) return;
+
+    const selector = '.message-item[data-message-id="' + messageId + '"]';
+    const messageItem = chatMessagesDiv.querySelector(selector);
+    if (!messageItem) return;
+
+    messageItem.classList.remove('streaming', 'thinking');
+    messageItem.classList.add(STREAM_STALL_CLASS);
+
+    const contentDiv = messageItem.querySelector('.md-content');
+    if (!contentDiv) return;
+    if (contentDiv.querySelector('.stream-stalled-notice')) return;
+
+    // 终态投影成功时中断原因已落进正文；只有占位符仍残留的兜底路径补标签，
+    // 避免同一句提示在气泡里出现两次。
+    const placeholder = contentDiv.querySelector('.thinking-indicator');
+    const placeholderOnly = placeholder !== null;
+    if (placeholder) placeholder.remove();
+
+    const notice = doc.createElement('div');
+    notice.className = 'stream-stalled-notice';
+    if (placeholderOnly) {
+        const label = doc.createElement('span');
+        label.className = 'stream-stalled-label';
+        label.textContent = STREAM_STALL_NOTICE_TEXT;
+        notice.appendChild(label);
+    }
+
+    if (typeof refs.onStalledStreamRetry === 'function') {
+        const retryButton = doc.createElement('button');
+        retryButton.type = 'button';
+        retryButton.className = 'stream-stalled-retry';
+        retryButton.textContent = '重新生成';
+        retryButton.addEventListener('click', () => {
+            if (retryButton.disabled) return;
+            retryButton.disabled = true;
+            Promise.resolve(refs.onStalledStreamRetry(messageId, { context, message, terminal }))
+                .catch(error => console.error('[StreamManager] Stalled retry handler failed for ' + messageId, error))
+                .finally(() => { retryButton.disabled = false; });
+        });
+        notice.appendChild(retryButton);
+    }
+
+    contentDiv.appendChild(notice);
 }
 
 const ownerDocument = () => refs.document || refs.chatMessagesDiv?.ownerDocument || null;
@@ -1431,6 +1612,7 @@ async function startStreamingMessage(message, passedMessageItem = null) {
     }
 
     activeStreamingMessages.set(messageId, context);
+    markStreamActivity(messageId);
 
     const { chatMessagesDiv, electronAPI, uiHelper } = refs;
     const nextViewSignature = getCurrentViewSignature();
@@ -1748,6 +1930,10 @@ function appendStreamChunk(messageId, chunkData, context, streamOperationId = nu
     if (streamOperationId && publishedRuntimeKey && publishedRuntimeKey !== incomingRuntimeKey) {
         return false;
     }
+    // 预缓冲阶段同样证明流仍在动 必须在分支前打点
+    // 否则初始化期的合法流会被巡检误判为静默
+    markStreamActivity(messageId);
+
     const initStatus = messageInitializationStatus.get(messageId);
 
     if (!initStatus || initStatus === 'pending') {
@@ -1876,6 +2062,8 @@ async function projectStreamTerminalInternal(messageId, finishReason, context, f
     // 终态入口已原子停止该消息的帧调度；不再排空平滑队列。
     // 下方直接使用生产端规范终稿（缺失时才回退累计文本）完成最终 DOM 投影。
     activeStreamingMessages.delete(messageId);
+    streamActivityAt.delete(String(messageId));
+    stopStallSweepIfIdle();
 
     // 🟢 清理节流定时器
     const scrollTimer = scrollThrottleTimers.get(messageId);
@@ -2126,6 +2314,8 @@ function discardStreamingMessage(messageId) {
     cleanupDesktopPushState(messageId);
     activeStreamingMessages.delete(messageId);
     messageRuntimeKeys.delete(String(messageId));
+    streamActivityAt.delete(String(messageId));
+    stopStallSweepIfIdle();
 }
 
 async function dispose() {
@@ -2169,6 +2359,11 @@ async function dispose() {
         activeStreamingMessages.clear();
         messageRuntimeKeys.clear();
         terminalProjectingMessages.clear();
+        streamActivityAt.clear();
+        if (stallSweepTimer) {
+            clearOwnedTimeout(stallSweepTimer);
+            stallSweepTimer = null;
+        }
         currentViewSignature = null;
         globalRenderLoopRunning = false;
         await Promise.allSettled([...pendingAsyncOperations]);
